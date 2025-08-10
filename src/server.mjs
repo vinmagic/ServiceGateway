@@ -9,6 +9,7 @@ import fs from "fs";
 import yaml from "js-yaml";
 import { PassThrough, Writable, Readable } from "stream";
 import pino from "pino";
+import path from "path";
 
 /* -------------------- Load config -------------------- */
 const config = yaml.load(fs.readFileSync("./config.yml", "utf8"));
@@ -258,27 +259,108 @@ const app = Fastify({
 
 // IMPORTANT: leave Fastify with no body parser so req.raw is an untouched stream
 app.removeAllContentTypeParsers();
-
-/* -------------------- Streams config (precompiled) -------------------- */
-const streamsCfgRaw = Array.isArray(config.streams) ? config.streams : [];
-const streamsCfg = streamsCfgRaw.map((s, i) => {
-  assert(s?.match?.path, `streams[${i}].match.path is required`);
-  let _re;
+/* -------------------- Streams config (hot-reload) -------------------- */
+function loadYamlFile(fp) {
   try {
-    _re = new RegExp(s.match.path);
+    const raw = fs.readFileSync(fp, "utf8");
+    return yaml.load(raw);
   } catch (e) {
-    throw new Error(
-      `Invalid regex in streams[${i}].match.path: ${String(e?.message || e)}`
-    );
+    console.warn("streams_yaml_load_failed", { file: fp, err: e?.message });
+    return null;
   }
-  return {
-    ...s,
-    _re,
-    _methods: s.match.methods
-      ? s.match.methods.map((m) => String(m).toUpperCase())
-      : null,
-  };
-});
+}
+
+function loadStreamsFromDir(dir) {
+  const out = [];
+  if (!dir) return out;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out; // directory optional
+  }
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    const lower = ent.name.toLowerCase();
+    if (!lower.endsWith(".yml") && !lower.endsWith(".yaml")) continue;
+    const fp = path.join(dir, ent.name);
+    const doc = loadYamlFile(fp);
+    if (!doc) continue;
+    if (Array.isArray(doc)) out.push(...doc);
+    else if (doc && typeof doc === "object") out.push(doc);
+  }
+  return out;
+}
+
+function compileStreams(rawList) {
+  return rawList.map((s, i) => {
+    const label = s?.id || `streams[${i}]`;
+    assert(s?.match?.path, `${label}.match.path is required`);
+    let _re;
+    try {
+      _re = new RegExp(s.match.path);
+    } catch (e) {
+      throw new Error(
+        `Invalid regex in ${label}.match.path: ${String(e?.message || e)}`
+      );
+    }
+    return {
+      ...s,
+      _re,
+      _methods: s.match.methods
+        ? s.match.methods.map((m) => String(m).toUpperCase())
+        : null,
+    };
+  });
+}
+
+const streamsDir =
+  config.server?.streamsDir || path.resolve(process.cwd(), "streams.d");
+
+// Atomic reference to current compiled config
+let streamsRef = { cfg: [] };
+
+function buildStreamsCfg() {
+  const merged = [
+    ...loadStreamsFromDir(streamsDir),
+    ...(Array.isArray(config.streams) ? config.streams : []),
+  ];
+  return compileStreams(merged);
+}
+
+// initial load
+streamsRef.cfg = buildStreamsCfg();
+
+// debounced watcher
+(function watchStreamsDir() {
+  let timer = null;
+  try {
+    fs.watch(streamsDir, { persistent: true }, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        try {
+          const next = buildStreamsCfg();
+          streamsRef = { cfg: next }; // atomic swap
+          logger?.info?.({ count: next.length }, "streams_reloaded_from_dir");
+        } catch (e) {
+          logger?.warn?.({ err: e?.message }, "streams_reload_failed");
+        }
+      }, 150); // tiny debounce to coalesce editor temp-file writes
+    });
+  } catch {
+    // directory may not exist; that’s fine
+  }
+})();
+
+// use streamsRef.cfg everywhere
+function findStream(method, path) {
+  const M = String(method).toUpperCase();
+  const list = streamsRef.cfg;
+  return list.find(
+    (s) => (!s._methods || s._methods.includes(M)) && s._re.test(path)
+  );
+}
+
 const preparedCols = new Map();
 
 async function getCollectionFor(name) {
@@ -323,13 +405,6 @@ app.addHook("onRequest", async (req, reply) => {
 
 /* -------------------- Small helpers -------------------- */
 const nsToMs = (ns) => (ns ? Number(ns) / 1e6 : 0);
-
-function findStream(method, path) {
-  const M = String(method).toUpperCase();
-  return streamsCfg.find(
-    (s) => (!s._methods || s._methods.includes(M)) && s._re.test(path)
-  );
-}
 
 const isJsonContentType = (ct) =>
   /^application\/(json|.*\+json)/i.test(ct || "");
@@ -749,6 +824,12 @@ async function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("SIGHUP", () => {
+  console.log(
+    { streamsDir },
+    "SIGHUP received — restart to reload stream configs"
+  );
+});
 
 /* -------------------- Start server -------------------- */
 await app.listen({ port: config.server.port, host: "0.0.0.0" });
