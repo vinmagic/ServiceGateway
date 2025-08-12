@@ -1,0 +1,1 @@
+SERVICE=servicegateway npm run deploy_app_node

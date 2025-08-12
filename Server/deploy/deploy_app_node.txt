@@ -1,0 +1,1 @@
+SERVICE=${SERVICE} npm run build_push && SERVICE=${SERVICE} SERVER=13.250.250.229 npm run deploy_app && SERVICE=${SERVICE} SERVER=54.169.197.182 npm run deploy_app && SERVICE=${SERVICE} SERVER=18.143.14.94 npm run deploy_app
