@@ -1,23 +1,21 @@
 // demoStream.mjs
 import { CreateService } from "../MicroService/src/main.mjs";
 
-const svc = await CreateService({
-  appName: "cube",
-  serviceName: "stream_consumer",
+const { onStream, logger } = await CreateService({
   configPath: "./config.yml",
 });
 
-// catch-all during testing
-const unDefault = svc.onStream("default", async (event, { logger }) => {
-  logger.info(
-    { eventId: event?.eventId, path: event?.route?.path },
-    "default_stream_event"
-  );
+// Will poll "events_payments"
+onStream("payments", async (doc, { logger }) => {
+  logger.info({ id: doc._id, amt: doc.amount }, "payment_processed");
 });
 
-// ctrl+c clean shutdown if you want
-process.on("SIGINT", async () => {
-  unDefault();
-  await svc.shutdown();
-  process.exit(0);
+// Will poll "events_orders"
+onStream("orders", async (doc, { logger }) => {
+  logger.info({ id: doc._id, orderId: doc.orderId }, "order_processed");
+});
+
+// Will poll "events"
+onStream("default", async (doc, { logger }) => {
+  logger.info({ path: doc?.route?.path }, "default_processed");
 });

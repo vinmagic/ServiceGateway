@@ -1,8 +1,12 @@
-// createService.js (poller-only, improved)
-// - streams.d hot-reload; "default" catch-all stream
-// - Per-TS-collection poller with resume (since + _id) stored in _consumer_offsets
-// - Routes docs to handlers based on method+path matching
-// - No overlapping polls; drains until caught up; graceful shutdown
+// src/main.mjs
+// Poller-only microservice (auto events_<streamId>)
+// - No streams.d; no regex matching
+// - onStream("<id>") => polls collection "events_<id>"
+//   onStream("default") => polls collection "events"
+// - Per-collection offsets in _consumer_offsets (since + _id)
+// - Per-stream bounded concurrency with backpressure
+// - Guard lag for clock skew, exponential backoff on errors
+// - Graceful shutdown: drains handlers, persists offsets
 
 import fs from "fs";
 import path from "path";
@@ -26,83 +30,16 @@ function createLogger(appName, serviceName, containerName) {
   });
 }
 
-/* -------------------- streams.d loader & matcher -------------------- */
-function loadYamlFile(fp) {
-  try {
-    return yaml.load(fs.readFileSync(fp, "utf8"));
-  } catch {
-    return null;
-  }
+/* -------------------- Helpers -------------------- */
+function collFor(streamId, defaultColl) {
+  return streamId === "default" ? defaultColl : `events_${streamId}`;
 }
 
-function loadStreamsFromDir(dir) {
-  const out = [];
-  let entries = [];
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const ent of entries) {
-    if (!ent.isFile()) continue;
-    const lower = ent.name.toLowerCase();
-    if (!lower.endsWith(".yml") && !lower.endsWith(".yaml")) continue;
-    const doc = loadYamlFile(path.join(dir, ent.name));
-    if (!doc) continue;
-    if (Array.isArray(doc)) out.push(...doc);
-    else if (typeof doc === "object") out.push(doc);
-  }
-  return out;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function compileStreams(rawList) {
-  return rawList.map((s, i) => {
-    const label = s?.id || `streams[${i}]`;
-    if (!s?.match?.path) throw new Error(`${label}.match.path is required`);
-    const flags =
-      typeof s.match?.flags === "string" ? s.match.flags.replace(/g/g, "") : "";
-    let _re;
-    try {
-      _re = new RegExp(s.match.path, flags);
-    } catch (e) {
-      throw new Error(`Invalid regex in ${label}.match.path: ${e?.message}`);
-    }
-    const _methods = s.match?.methods
-      ? s.match.methods.map((m) => String(m).toUpperCase())
-      : null;
-    const collection = s.collection || null; // optional per-stream TS collection name
-    return { ...s, _re, _methods, collection };
-  });
-}
-
-function matchStream(list, method, pathStr) {
-  const M = String(method || "").toUpperCase();
-  for (const s of list) {
-    if (s._methods && !s._methods.includes(M)) continue;
-    s._re.lastIndex = 0;
-    if (s._re.test(pathStr)) return s;
-  }
-  return null;
-}
-
-/* -------------------- helpers -------------------- */
-function computeAllowedTsCollections(config, streamsCfg) {
-  const names = new Set();
-  const eventsCol = config.mongo.eventsCollection || "events";
-  names.add(eventsCol);
-  for (const s of streamsCfg) {
-    if (
-      s?.collection &&
-      typeof s.collection === "string" &&
-      s.collection.trim()
-    ) {
-      names.add(s.collection.trim());
-    }
-  }
-  return names;
-}
-
-/* -------------------- CreateService (poller-only) -------------------- */
+/* -------------------- CreateService -------------------- */
 export async function CreateService({
   appName = "cube",
   serviceName = "stream_consumer",
@@ -116,140 +53,41 @@ export async function CreateService({
   const logger = createLogger(appName, serviceName, containerName);
   logger.info("service_ready");
 
-  // streams.d hot-reload
-  const STREAMS_DIR =
-    config.server?.streamsDir || path.resolve(process.cwd(), "streams.d");
-
-  const buildStreamsCfg = () =>
-    compileStreams([
-      ...loadStreamsFromDir(STREAMS_DIR),
-      ...(Array.isArray(config.streams) ? config.streams : []),
-    ]);
-
-  let streamsRef = { cfg: [] };
-  let allowedTs = new Set();
-
-  async function startPoller(coll) {
-    if (pollers.has(coll)) return;
-    // preload offset state
-    pollState.set(coll, await loadOffset(coll));
-    pollers.set(coll, { running: false });
-    logger.warn({ coll, POLL_MS }, "ts_poller_started");
-    pollLoop(coll).catch(() => {});
-  }
-
-  function stopPoller(coll) {
-    if (!pollers.has(coll)) return;
-    pollers.delete(coll);
-    logger.info({ coll }, "ts_poller_stopped");
-  }
-
-  const reloadStreamsImpl = () => {
-    let nextCfg;
-    try {
-      nextCfg = buildStreamsCfg();
-    } catch (e) {
-      logger.error({ err: e }, "streams_reload_failed_keep_previous");
-      return;
-    }
-    streamsRef = { cfg: nextCfg };
-    const newAllowed = computeAllowedTsCollections(config, streamsRef.cfg);
-
-    // start/stop pollers based on allowed set diffs
-    for (const c of newAllowed)
-      if (!allowedTs.has(c)) startPoller(c).catch(() => {});
-    for (const c of allowedTs) if (!newAllowed.has(c)) stopPoller(c);
-
-    allowedTs = newAllowed;
-    logger.info(
-      { count: streamsRef.cfg.length, allowedTs: [...allowedTs] },
-      "streams_reloaded"
-    );
-  };
-
-  reloadStreamsImpl();
-
-  let streamsReloadTimer = null;
-  try {
-    fs.watch(STREAMS_DIR, { persistent: true }, () => {
-      if (streamsReloadTimer) clearTimeout(streamsReloadTimer);
-      streamsReloadTimer = setTimeout(reloadStreamsImpl, 200);
-      streamsReloadTimer.unref?.();
-    });
-  } catch {
-    /* dir may not exist; that's fine */
-  }
-
-  // Mongo
+  // DB connect
   const client = new MongoClient(config.mongo.uri, {
-    maxPoolSize: 50,
+    maxPoolSize: Number(config.mongo?.maxPoolSize ?? 50),
     readPreference: "primary",
   });
   await client.connect();
   const db = client.db(config.mongo.db);
 
+  // Tunables
   const timeField = config.mongo.timeSeries?.timeField || "receivedAt";
-  const metaField = config.mongo.timeSeries?.metaField || "route";
   const POLL_MS = Number(config.mongo.timeSeries?.pollMs ?? 1000);
+  const BATCH_LIMIT = Number(config.mongo.timeSeries?.batchLimit ?? 2000);
+  const FIND_MAX_TIME_MS = Number(
+    config.mongo.timeSeries?.findMaxTimeMs ?? 5000
+  );
   const OFFSETS_COLL =
     config.mongo.timeSeries?.offsetsCollection || "_consumer_offsets";
-  const MAX_BACKFILL_MS = 7 * 24 * 3600 * 1000; // clamp to 7 days
+  const MAX_BACKFILL_MS = 7 * 24 * 3600 * 1000;
   const INITIAL_BACKFILL_MS = Math.min(
     Number(config.mongo.timeSeries?.initialBackfillMs ?? 10_000),
     MAX_BACKFILL_MS
   );
+  const GUARD_LAG_MS = Number(config.mongo.timeSeries?.guardLagMs ?? 0);
+  const defaultEventsCollection = config.mongo.eventsCollection || "events";
 
-  // Ensure offsets index exists (unique on _id by default, but explicit is fine)
   try {
     await db.collection(OFFSETS_COLL).createIndex({ ts: 1 });
   } catch (e) {
     logger.warn({ err: e }, "offsets_index_create_warning");
   }
 
-  // ---- Processors registry ----
-  const processors = new Map(); // id -> { fn, concurrency }
-  function onStream(id, handler, { concurrency = 8 } = {}) {
-    processors.set(id, { fn: handler, concurrency });
-    return () => processors.delete(id);
-  }
-  function getProcessor(streamId) {
-    return processors.get(streamId) || processors.get("default") || null;
-  }
-
-  async function routeDoc(doc, srcTag) {
-    if (!doc.route && metaField !== "route" && doc[metaField])
-      doc.route = doc[metaField];
-
-    const method = (
-      doc?.route?.method ||
-      doc?.route?.Method ||
-      "GET"
-    ).toUpperCase();
-    const pathStr =
-      doc?.route?.path || doc?.route?.url || doc?.route?.Path || "";
-
-    const matched = matchStream(streamsRef.cfg, method, pathStr);
-    const streamId = matched?.id || "default";
-    const proc = getProcessor(streamId);
-
-    if (proc) {
-      const { fn } = proc;
-      await fn(doc, {
-        logger: logger.child({ streamId, src: srcTag }),
-        streamRule: matched,
-        config,
-      });
-    } else {
-      logger.debug(
-        { streamId, method, path: pathStr },
-        "no_handler_for_stream"
-      );
-    }
-  }
-
-  /* -------------------- Poller core -------------------- */
-  const pollers = new Map(); // coll -> { running:boolean }
+  // State
+  const pollers = new Map(); // coll -> { running:boolean, delay:number }
   const pollState = new Map(); // coll -> { since: Date, lastId: ObjectId|null }
+  const processors = new Map(); // streamId -> { fn, concurrency, maxQueue, queue:Set<Promise> }
 
   async function loadOffset(coll) {
     const row = await db
@@ -270,39 +108,80 @@ export async function CreateService({
       );
   }
 
-  // Return number of docs processed this iteration
-  async function pollOnce(coll) {
+  async function routeDocTo(streamId, doc, srcTag) {
+    const proc = processors.get(streamId) || processors.get("default");
+    if (!proc) {
+      logger.debug({ streamId }, "no_handler_for_stream");
+      return;
+    }
+    const { fn, concurrency, maxQueue, queue } = proc;
+
+    // Basic backpressure
+    if (queue.size >= maxQueue) {
+      logger.warn(
+        { streamId, size: queue.size, maxQueue },
+        "stream_queue_overflow"
+      );
+      await Promise.race(queue);
+    }
+
+    const p = (async () => {
+      try {
+        const child = logger.child({ streamId, src: srcTag });
+        await fn(doc, { logger: child, streamId, config });
+      } catch (err) {
+        logger.error({ err, streamId }, "stream_handler_error");
+      } finally {
+        queue.delete(p);
+      }
+    })();
+
+    queue.add(p);
+    if (queue.size >= concurrency) await Promise.race(queue);
+  }
+
+  const badTimeWarned = new Set(); // coll
+  async function pollOnce(coll, streamId) {
     const state = pollState.get(coll);
     if (!state) return 0;
-    const col = db.collection(coll);
 
     const query = state.lastId
       ? { [timeField]: { $gte: state.since }, _id: { $gt: state.lastId } }
       : { [timeField]: { $gt: state.since } };
 
-    const docs = await col
+    const docs = await db
+      .collection(coll)
       .find(query)
       .sort({ [timeField]: 1, _id: 1 })
-      // .hint({ [timeField]: 1, _id: 1 }) // optional if you create this index
-      .limit(2000)
+      .limit(BATCH_LIMIT)
+      .maxTimeMS(FIND_MAX_TIME_MS)
       .toArray();
 
     if (!docs.length) return 0;
 
     for (const d of docs) {
-      if (!d.route && metaField !== "route" && d[metaField])
-        d.route = d[metaField];
-      await routeDoc(d, "poll");
-      if (d[timeField] > state.since) state.since = d[timeField];
+      const dt = d[timeField];
+      if (!(dt instanceof Date)) {
+        if (!badTimeWarned.has(coll)) {
+          logger.warn(
+            { coll, badDocId: d?._id, timeField },
+            "doc_missing_or_non_date_timefield"
+          );
+          badTimeWarned.add(coll);
+        }
+      } else {
+        await routeDocTo(streamId, d, "poll");
+        if (dt > state.since)
+          state.since = new Date(dt.getTime() - GUARD_LAG_MS);
+      }
       state.lastId = d._id;
     }
+
     await saveOffset(coll, state.since, state.lastId);
     return docs.length;
   }
 
-  async function pollLoop(coll) {
-    const state = pollState.get(coll);
-    if (!state) return;
+  async function pollLoop(coll, streamId) {
     const ctl = pollers.get(coll);
     if (!ctl || ctl.running) return;
     ctl.running = true;
@@ -310,25 +189,71 @@ export async function CreateService({
     try {
       let fetched = 0;
       do {
-        fetched = await pollOnce(coll);
+        fetched = await pollOnce(coll, streamId);
+        // Yield when catching up heavily
+        if (fetched >= Math.min(BATCH_LIMIT, 1000))
+          await new Promise((r) => setImmediate(r));
       } while (fetched > 0);
+      ctl.delay = POLL_MS; // reset backoff after a clean pass
     } catch (err) {
-      logger.error({ err, coll }, "ts_poller_loop_error");
+      logger.error({ err, coll }, "poller_error");
+      // exponential backoff up to 10x
+      ctl.delay = Math.min((ctl.delay || POLL_MS) * 2, POLL_MS * 10);
     } finally {
       ctl.running = false;
       if (pollers.has(coll)) {
-        setTimeout(() => pollLoop(coll).catch(() => {}), POLL_MS).unref?.();
+        setTimeout(
+          () => pollLoop(coll, streamId).catch(() => {}),
+          ctl.delay || POLL_MS
+        ).unref?.();
       }
     }
   }
 
-  // start pollers for initial allowed set
-  for (const coll of allowedTs) await startPoller(coll);
+  async function startPollerForStream(streamId) {
+    const coll = collFor(streamId, defaultEventsCollection);
+    if (pollers.has(coll)) return;
+    pollState.set(coll, await loadOffset(coll));
+    pollers.set(coll, { running: false, delay: POLL_MS });
+    logger.info(
+      { coll, streamId, timeField, pollMs: POLL_MS },
+      "poller_started"
+    );
+    pollLoop(coll, streamId).catch(() => {});
+  }
+
+  function onStream(
+    streamId,
+    handler,
+    { concurrency = 8, maxQueue = 2048 } = {}
+  ) {
+    processors.set(streamId, {
+      fn: handler,
+      concurrency,
+      maxQueue,
+      queue: new Set(),
+    });
+    // Kick off the poller for this streamId’s collection
+    startPollerForStream(streamId).catch((e) =>
+      logger.error({ err: e, streamId }, "start_poller_failed")
+    );
+    // Convenience: return an unsubscribe
+    return () => processors.delete(streamId);
+  }
 
   async function shutdown() {
     try {
-      // stop scheduling further loops
-      for (const coll of pollers.keys()) {
+      // Stop future polls
+      for (const coll of pollers.keys()) pollers.delete(coll);
+
+      // Drain all processors
+      const waits = [];
+      for (const { queue } of processors.values())
+        waits.push(Promise.allSettled([...queue]));
+      await Promise.allSettled(waits);
+
+      // Persist final offsets
+      for (const coll of pollState.keys()) {
         const st = pollState.get(coll);
         if (st) await saveOffset(coll, st.since, st.lastId);
       }
@@ -338,13 +263,8 @@ export async function CreateService({
     }
   }
 
-  // Graceful shutdown hooks
-  process.on("SIGINT", () => {
-    shutdown().finally(() => process.exit(0));
-  });
-  process.on("SIGTERM", () => {
-    shutdown().finally(() => process.exit(0));
-  });
+  process.on("SIGINT", () => shutdown().finally(() => process.exit(0)));
+  process.on("SIGTERM", () => shutdown().finally(() => process.exit(0)));
 
   return { onStream, shutdown, logger, config };
 }
