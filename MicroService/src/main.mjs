@@ -16,6 +16,9 @@ import pino from "pino";
 import { MongoClient, ObjectId } from "mongodb";
 import { v4 as uuidv4 } from "uuid";
 import { ConnectStore } from "./db.mjs";
+import got from "got";
+import http from "http";
+import https from "https";
 
 /* -------------------- Config + logger -------------------- */
 function loadConfig(cfgPath = "./config.yml") {
@@ -386,6 +389,49 @@ export async function CreateService({
     }
   }
 
+  const createGotInstance = (baseURL, cookieJar = null, headers = null) => {
+    const httpAgent = new http.Agent({ keepAlive: true });
+    const httpsAgent = new https.Agent({ keepAlive: true });
+
+    const options = {
+      prefixUrl: baseURL,
+      agent: {
+        http: httpAgent,
+        https: httpsAgent,
+      },
+    };
+
+    if (cookieJar) {
+      options.cookieJar = cookieJar;
+    }
+
+    if (headers) {
+      options.headers = headers;
+    }
+
+    const api = got.extend(options);
+
+    return api;
+  };
+
+  const services = new Map();
+
+  function getService(serviceUrl) {
+    if (!services.has(serviceUrl)) {
+      services.set(serviceUrl, createGotInstance(serviceUrl));
+    }
+    return services.get(serviceUrl);
+  }
+
+  const stores = new Map(); // safer than plain object for arbitrary URLs
+
+  function getStore(dbUrl) {
+    if (!stores.has(dbUrl)) {
+      stores.set(dbUrl, ConnectStore(dbUrl));
+    }
+    return stores.get(dbUrl);
+  }
+
   process.on("SIGINT", () => shutdown().finally(() => process.exit(0)));
   process.on("SIGTERM", () => shutdown().finally(() => process.exit(0)));
 
@@ -394,7 +440,8 @@ export async function CreateService({
     shutdown,
     logger,
     config,
-    connectStore: ConnectStore,
+    getStore,
+    getService,
   };
 }
 

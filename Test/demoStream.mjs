@@ -1,9 +1,12 @@
 // demoStream.mjs
 import { CreateService } from "../MicroService/src/main.mjs";
 
-const { onStream, logger, config, connectStore } = await CreateService({
+const { onStream, logger, config, getStore, getService } = await CreateService({
   appName: "test",
 });
+
+const service = getService("http://localhost:3000");
+
 
 // Will poll "events_payments"
 onStream(
