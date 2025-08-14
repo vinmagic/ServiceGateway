@@ -22,7 +22,6 @@ function assert(cond, msg) {
 assert(config?.server?.port, "server.port is required");
 assert(config?.server?.maxBodyBytes, "server.maxBodyBytes is required");
 assert(config?.mongo?.uri, "mongo.uri is required");
-assert(config?.mongo?.db, "mongo.db is required");
 assert(config?.mongo?.eventsCollection, "mongo.eventsCollection is required");
 assert(
   typeof config?.mongo?.retentionDays === "number",
@@ -275,6 +274,10 @@ const app = Fastify({
 
 // IMPORTANT: leave Fastify with no body parser so req.raw is an untouched stream
 app.removeAllContentTypeParsers();
+
+app.addContentTypeParser("*", (req, payload, done) => {
+  done(null, payload);
+});
 
 /* -------------------- Streams config (hot-reload) -------------------- */
 function loadYamlFile(fp) {

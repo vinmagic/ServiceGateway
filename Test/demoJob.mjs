@@ -13,11 +13,13 @@ const worker = await CreateService({
   },
 });
 
-const job = worker.startJob(
+const { logger, startJob } = worker;
+
+const job = startJob(
   {
     /* state */
   },
-  async (state, setInterval, { logger }) => {
+  async (state, setInterval) => {
     // do work...
     logger.info({ n: 42 }, "processed_batch");
     setInterval(250);
