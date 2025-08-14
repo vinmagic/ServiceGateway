@@ -30,11 +30,15 @@ assert(
 
 const DEBUG_RESPONSES = !!config.server?.debugResponses;
 const DENY_BY_DEFAULT = !!config.server?.denyByDefault;
+const SYNC_WAIT_MS = Number(config.server?.syncWaitMs ?? 4000);
 
 /* Collection names (with sensible defaults) */
 const METRICS_COLLECTION = config.mongo.metricsCollection || "events_rt";
 const LOGS_COLLECTION = config.mongo.logsCollection || "applogs";
 const DENIED_COLLECTION = config.mongo.deniedCollection || "events_denied";
+const GLOBAL_RESULTS_COLLECTION =
+  config.mongo.resultsCollection || "events_results";
+const RESULTS_TTL_DAYS = Number(config.mongo.resultsTtlDays ?? 1);
 
 /* -------------------- Mongo bootstrap -------------------- */
 const client = new MongoClient(config.mongo.uri, { maxPoolSize: 50 });
@@ -78,7 +82,7 @@ async function ensureTsCollection(
 
 const TIME_FIELD = config.mongo.timeSeries?.timeField || "receivedAt";
 
-/* -------------------- Prepare collections (TS only) -------------------- */
+/* -------------------- Prepare TS collections -------------------- */
 const eventsCol = await ensureTsCollection(config.mongo.eventsCollection, {
   timeField: TIME_FIELD,
   metaField: config.mongo.timeSeries?.metaField || "route",
@@ -89,6 +93,7 @@ await Promise.allSettled([
   eventsCol.createIndex({ "route.streamId": 1, "route.path": 1 }),
   eventsCol.createIndex({ eventId: 1 }, { unique: true }),
   eventsCol.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
+  eventsCol.createIndex({ correlationId: 1, [TIME_FIELD]: -1 }), // NEW: correlate quickly
 ]);
 
 const metricsCol = await ensureTsCollection(METRICS_COLLECTION, {
@@ -127,6 +132,30 @@ await Promise.allSettled([
   deniedCol.createIndex({ "route.host": 1, "route.path": 1, at: -1 }),
   deniedCol.createIndex({ code: 1, at: -1 }),
 ]);
+
+/* -------------------- Results collections (non-TS) -------------------- */
+const preparedResultCols = new Map(); // name -> collection
+const knownResultCollectionNames = new Set(); // filled from streams + global fallback
+
+async function ensureResultsCollection(name) {
+  const exists = await db.listCollections({ name }).hasNext();
+  if (!exists) await db.createCollection(name);
+  const col = db.collection(name);
+  await Promise.allSettled([
+    col.createIndex({ correlationId: 1 }, { unique: true }),
+    col.createIndex({ updatedAt: -1 }),
+    col.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }), // absolute TTL
+  ]);
+  return col;
+}
+
+async function getResultsCollectionFor(name) {
+  const key = name || GLOBAL_RESULTS_COLLECTION;
+  if (!preparedResultCols.has(key)) {
+    preparedResultCols.set(key, await ensureResultsCollection(key));
+  }
+  return preparedResultCols.get(key);
+}
 
 /* -------------------- Log streams: Mongo writer + tee -------------------- */
 function createMongoLogStream({
@@ -204,7 +233,7 @@ function createMongoLogStream({
   return dest;
 }
 
-/** Tee stream that writes to multiple destinations (stdout + mongo logger) with backpressure, single-callback safety. */
+/** Tee stream writing to multiple destinations */
 function createTeeStream(streams) {
   return new Writable({
     write(chunk, enc, cb) {
@@ -229,7 +258,7 @@ function createTeeStream(streams) {
             });
           }
         } catch {
-          // ignore write errors on individual destinations
+          // ignore
         }
       }
 
@@ -354,7 +383,6 @@ function compileStreams(rawList) {
       _methods: s.match.methods
         ? s.match.methods.map((m) => String(m).toUpperCase())
         : null,
-      // pass through s.action, s.collection, etc.
     };
   });
 }
@@ -362,7 +390,7 @@ function compileStreams(rawList) {
 const streamsDir =
   config.server?.streamsDir || path.resolve(process.cwd(), "streams.d");
 
-// Atomic reference to current compiled config
+// Atomic reference to current compiled config + known result collections
 let streamsRef = { cfg: [] };
 
 function buildStreamsCfg() {
@@ -370,7 +398,26 @@ function buildStreamsCfg() {
     ...loadStreamsFromDir(streamsDir),
     ...(Array.isArray(config.streams) ? config.streams : []),
   ];
-  return compileStreams(merged);
+  const compiled = compileStreams(merged);
+
+  // Rebuild known result collections set from all rules:
+  knownResultCollectionNames.clear();
+  // From request rules declaring resultCollection
+  for (const s of compiled) {
+    if (s?.resultCollection) {
+      knownResultCollectionNames.add(s.resultCollection);
+    }
+  }
+  // Also consider any rule whose 'collection' name looks like a results collection
+  for (const s of compiled) {
+    if (s?.collection && /^results[_-]/i.test(s.collection)) {
+      knownResultCollectionNames.add(s.collection);
+    }
+  }
+  // Always include global fallback
+  knownResultCollectionNames.add(GLOBAL_RESULTS_COLLECTION);
+
+  return compiled;
 }
 
 // initial load
@@ -382,22 +429,26 @@ streamsRef.cfg = buildStreamsCfg();
   try {
     fs.watch(streamsDir, { persistent: true }, () => {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
+      timer = setTimeout(async () => {
         try {
           const next = buildStreamsCfg();
           streamsRef = { cfg: next }; // atomic swap
+          // pre-create result collections that are referenced
+          for (const name of knownResultCollectionNames) {
+            await getResultsCollectionFor(name).catch(() => {});
+          }
           logger?.info?.({ count: next.length }, "streams_reloaded_from_dir");
         } catch (e) {
           logger?.warn?.({ err: e?.message }, "streams_reload_failed");
         }
-      }, 150); // tiny debounce to coalesce editor temp-file writes
+      }, 150);
     });
   } catch {
     // directory may not exist; that’s fine
   }
 })();
 
-// use streamsRef.cfg everywhere
+// helper
 function findStream(method, urlPath, host) {
   const M = String(method).toUpperCase();
   const list = streamsRef.cfg;
@@ -423,6 +474,7 @@ async function getCollectionFor(name) {
       col.createIndex({ "route.streamId": 1, "route.path": 1 }),
       col.createIndex({ eventId: 1 }, { unique: true }),
       col.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
+      col.createIndex({ correlationId: 1, [TIME_FIELD]: -1 }),
     ]);
     preparedCols.set(name, col);
   }
@@ -431,7 +483,7 @@ async function getCollectionFor(name) {
 
 /* -------------------- Security (API key) -------------------- */
 app.addHook("onRequest", async (req, reply) => {
-  req._t0_req = process.hrtime.bigint(); // earliest stamp for total time
+  req._t0_req = process.hrtime.bigint();
   req.clientIp = req.ip;
   req.clientIpChain = req.headers["x-forwarded-for"];
   const apikeys = config.security?.apiKeys;
@@ -567,6 +619,57 @@ function streamToGridFS({ stream, filename, contentType, limit, metadata }) {
 /* -------------------- Health endpoint (excluded from capture) -------------------- */
 app.get("/__health", async () => ({ ok: true }));
 
+/* -------------------- Wait helper against a specific results collection -------------------- */
+// Replace your waitForResultIn with this bounded-poll version
+async function waitForResultIn(resultsCol, correlationId, timeoutMs) {
+  const deadline = Date.now() + Math.max(0, timeoutMs ?? 0);
+
+  // 1) Fast path: already written?
+  const existing = await resultsCol.findOne({ correlationId });
+  if (existing && (existing.status === "done" || existing.status === "error")) {
+    return { ready: true, doc: existing };
+  }
+
+  // 2) Open a change stream and poll with tryNext() until timeout
+  //    Keep maxAwaitTimeMS small so each await returns regularly.
+  const cs = resultsCol.watch(
+    [
+      {
+        $match: {
+          "fullDocument.correlationId": correlationId,
+          operationType: { $in: ["insert", "update", "replace"] },
+        },
+      },
+    ],
+    { fullDocument: "updateLookup", maxAwaitTimeMS: 500 } // short server-side wait
+  );
+
+  try {
+    while (Date.now() < deadline) {
+      const change = await cs.tryNext(); // returns null if nothing ready
+      if (change && change.fullDocument) {
+        const doc = change.fullDocument;
+        if (doc.status === "done" || doc.status === "error") {
+          try { await cs.close(); } catch {}
+          return { ready: true, doc };
+        }
+      }
+
+      // Optional: cheap recheck in case another process wrote between polls
+      const doc = await resultsCol.findOne({ correlationId });
+      if (doc && (doc.status === "done" || doc.status === "error")) {
+        try { await cs.close(); } catch {}
+        return { ready: true, doc };
+      }
+    }
+  } catch (e) {
+    // swallow and fall through to not-ready
+  }
+
+  try { await cs.close(); } catch {}
+  return { ready: false };
+}
+
 /* -------------------- Universal capture route -------------------- */
 app.all("/*", async (req, reply) => {
   // CORS preflight handled here (avoid duplicate app.options route)
@@ -642,6 +745,88 @@ app.all("/*", async (req, reply) => {
     return reply.code(403).send({ error: "forbidden" });
   }
 
+  // If we have a match and the matched collection is a RESULT collection (Option A "treat as normal rule"),
+  // we perform a results upsert instead of TS insert.
+  if (matched && knownResultCollectionNames.has(matched.collection)) {
+    try {
+      const contentType = req.headers["content-type"] || "application/json";
+      const bodyStream = ensureBodyStream(req);
+      const { buf, size } = await readToBufferWithLimit(
+        bodyStream,
+        config.server.maxBodyBytes
+      );
+      if (size === 0) return reply.code(400).send({ error: "empty_body" });
+
+      let payload = null;
+      if (isJsonContentType(contentType)) {
+        try {
+          payload = JSON.parse(buf.toString("utf8"));
+        } catch {
+          return reply.code(400).send({ error: "invalid_json" });
+        }
+      } else if (isTextLike(contentType)) {
+        payload = { text: buf.toString("utf8") };
+      } else {
+        // binary — store opaque bytes base64 if needed
+        payload = { base64: buf.toString("base64") };
+      }
+
+      const correlationId =
+        req.headers["x-correlation-id"] ||
+        payload?.correlationId ||
+        payload?.eventId;
+
+      if (!correlationId) {
+        return reply.code(400).send({ error: "missing_correlation_id" });
+      }
+
+      const status = payload?.status || "done";
+      const result = Object.prototype.hasOwnProperty.call(payload, "result")
+        ? payload.result
+        : payload; // store full payload if no result field
+      const error = payload?.error ?? null;
+
+      const resultsCol = await getResultsCollectionFor(matched.collection);
+
+      await resultsCol.updateOne(
+        { correlationId },
+        {
+          $set: {
+            correlationId,
+            status,
+            result,
+            error,
+            updatedAt: new Date(),
+            expiresAt: new Date(Date.now() + RESULTS_TTL_DAYS * 86400_000),
+            meta: {
+              streamId: matched.id,
+              host,
+              path: urlPath,
+              sourceIp: req.ip,
+              ua: req.headers["user-agent"],
+            },
+          },
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { upsert: true }
+      );
+
+      return reply
+        .header("X-Correlation-Id", correlationId)
+        .header("X-Result-Collection", matched.collection)
+        .code(200)
+        .send({ ok: true, correlationId, status });
+    } catch (e) {
+      req.log.error(e, "result_ingest_failed");
+      return reply.code(500).send({
+        error: "result_ingest_failed",
+        ...(DEBUG_RESPONSES ? { message: String(e?.message) } : {}),
+      });
+    }
+  }
+
+  // ----- Normal capture flow (TS insert + optional short wait) -----
+
   const streamId = matched?.id || "default";
   const targetCol = await getCollectionFor(
     matched?.collection || config.mongo.eventsCollection
@@ -653,6 +838,7 @@ app.all("/*", async (req, reply) => {
   const isChunked = /chunked/i.test(transferEncoding || "");
   const limit = config.server.maxBodyBytes;
   const eventId = chooseEventId();
+  const correlationId = eventId; // root correlation is request event id
 
   // Pre-check: if client declares a too-large body, reject early
   if (declaredLen && declaredLen > limit) {
@@ -708,7 +894,14 @@ app.all("/*", async (req, reply) => {
           filename: `${eventId}`,
           contentType,
           limit,
-          metadata: { eventId, streamId, path: urlPath, method, receivedAt },
+          metadata: {
+            eventId,
+            correlationId,
+            streamId,
+            path: urlPath,
+            method,
+            receivedAt,
+          },
         });
         if (size === 0 || !id) {
           bodyInfo = { type: "none", size: 0, data: null };
@@ -749,7 +942,14 @@ app.all("/*", async (req, reply) => {
             filename: `${eventId}`,
             contentType,
             limit,
-            metadata: { eventId, streamId, path: urlPath, method, receivedAt },
+            metadata: {
+              eventId,
+              correlationId,
+              streamId,
+              path: urlPath,
+              method,
+              receivedAt,
+            },
           });
           if (gsize === 0 || !id) {
             bodyInfo = { type: "none", size: 0, data: null };
@@ -770,7 +970,14 @@ app.all("/*", async (req, reply) => {
           filename: `${eventId}`,
           contentType,
           limit,
-          metadata: { eventId, streamId, path: urlPath, method, receivedAt },
+          metadata: {
+            eventId,
+            correlationId,
+            streamId,
+            path: urlPath,
+            method,
+            receivedAt,
+          },
         });
         if (size === 0 || !id) {
           bodyInfo = { type: "none", size: 0, data: null };
@@ -788,6 +995,7 @@ app.all("/*", async (req, reply) => {
 
     const doc = {
       eventId,
+      correlationId, // <— root correlation
       receivedAt, // TS timeField (must be set at insert)
       route: { method, path: urlPath, streamId, host },
       source: {
@@ -820,6 +1028,7 @@ app.all("/*", async (req, reply) => {
 
     const res = reply
       .header("X-Event-Id", eventId)
+      .header("X-Correlation-Id", correlationId)
       .header("X-Stream-Id", streamId);
 
     if (bodyInfo.type === "gridfs" && gridfsId) {
@@ -828,7 +1037,54 @@ app.all("/*", async (req, reply) => {
         .header("X-Body-Id", String(gridfsId));
     }
 
-    res.code(202).send({ status: "accepted", eventId, streamId });
+    // Optional short wait per stream using that stream's resultCollection
+    const shouldWait = !!matched?.waitForResult;
+    const waitMs = Number.isFinite(matched?.waitMs)
+      ? Number(matched.waitMs)
+      : SYNC_WAIT_MS;
+
+    if (shouldWait && waitMs > 0) {
+      const resultColName =
+        matched?.resultCollection || GLOBAL_RESULTS_COLLECTION;
+
+      // ensure the declared result collection is known and prepared
+      knownResultCollectionNames.add(resultColName);
+      const resultsCol = await getResultsCollectionFor(resultColName);
+
+      let fast = { ready: false };
+      try {
+        fast = await waitForResultIn(resultsCol, correlationId, waitMs);
+      } catch {
+        fast = { ready: false };
+      }
+
+      if (fast.ready && fast.doc?.status === "done") {
+        return res.code(200).send({
+          status: "done",
+          eventId,
+          streamId,
+          result: fast.doc.result ?? null,
+        });
+      }
+      if (fast.ready && fast.doc?.status === "error") {
+        return res.code(500).send({
+          status: "error",
+          eventId,
+          streamId,
+          error: fast.doc.error ?? "processing_failed",
+        });
+      }
+    }
+
+    // async fallback
+    res
+      .code(202)
+      .send({
+        status: "accepted",
+        eventId,
+        streamId,
+        pollUrl: `/results/${eventId}`,
+      });
   } catch (e) {
     if (e?.message === "payload_too_large") {
       req._metrics.code = 413;
@@ -875,6 +1131,57 @@ app.get("/__body/:eventId", async (req, reply) => {
   reply.header("content-type", ct.includes("json") ? "application/json" : ct);
   if (ev.body?.type === "json") return reply.send(ev.body.data);
   return reply.send(String(ev.body?.data ?? ""));
+});
+
+/* -------------------- Results polling (respects per-stream result collections) -------------------- */
+app.get("/results/:eventId", async (req, reply) => {
+  const correlationId = req.params.eventId;
+
+  // Find the original request's stream to locate its configured resultCollection
+  let reqEvent = await eventsCol.findOne(
+    { eventId: correlationId },
+    { projection: { route: 1 } }
+  );
+  if (!reqEvent && config.mongo.usePerStreamCollections) {
+    for (const [, col] of preparedCols.entries()) {
+      reqEvent = await col.findOne(
+        { eventId: correlationId },
+        { projection: { route: 1 } }
+      );
+      if (reqEvent) break;
+    }
+  }
+
+  const streamId = reqEvent?.route?.streamId || "default";
+  const streamCfg = streamsRef.cfg.find(
+    (s) => (s.id || "default") === streamId
+  );
+
+  const resultColName =
+    streamCfg?.resultCollection || GLOBAL_RESULTS_COLLECTION;
+
+  // ensure prepared
+  knownResultCollectionNames.add(resultColName);
+  const resultsCol = await getResultsCollectionFor(resultColName);
+  const doc = await resultsCol.findOne({ correlationId });
+
+  if (!doc) return reply.send({ status: "processing", eventId: correlationId });
+  if (doc.status === "done")
+    return reply.send({
+      status: "done",
+      eventId: correlationId,
+      result: doc.result ?? null,
+    });
+  if (doc.status === "error")
+    return reply.code(500).send({
+      status: "error",
+      eventId: correlationId,
+      error: doc.error ?? "processing_failed",
+    });
+  return reply.send({
+    status: String(doc.status || "processing"),
+    eventId: correlationId,
+  });
 });
 
 /* -------------------- After-response: write metrics -------------------- */
