@@ -1,19 +1,17 @@
 // src/main.mjs
-// Poller-only microservice (auto events_<streamId>)
-// - onStream("<id>") => polls collection "events_<id>"
-//   onStream("default") => polls collection "events"
-// - Per-collection offsets in _consumer_offsets (since + _lastId)
-// - Per-stream bounded concurrency with backpressure
-// - Guard lag for clock skew, exponential backoff on errors
-// - Per-stream overrides: initialBackfillMs, resetOffset
-// - Per-stream mapDoc: shape the doc before it reaches the handler (sync or async)
+// Auto-pump microservice (continuous pull after handler finishes)
+// - onStream("<id>") => reads from "events_<id>"; "default" => "events"
+// - Auto-starts and keeps pulling: after each wave drains, pulls the next batch
+// - If a batch is EMPTY, schedules a single "idle nudge" and retries after idleNudgeMs
+// - Bounded concurrency within a wave; offsets saved after each batch
+// - Per-stream overrides: initialBackfillMs, resetOffset, mapDoc, idleNudgeMs
 // - Graceful shutdown: drains handlers, persists offsets
 
 import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
 import pino from "pino";
-import { MongoClient, ObjectId } from "mongodb";
+import { MongoClient } from "mongodb";
 import { v4 as uuidv4 } from "uuid";
 import { ConnectStore } from "./db.mjs";
 import got from "got";
@@ -64,7 +62,6 @@ export async function CreateService({
 
   // Tunables (global defaults)
   const timeField = config.mongo.timeSeries?.timeField || "receivedAt";
-  const POLL_MS = Number(config.mongo.timeSeries?.pollMs ?? 1000);
   const BATCH_LIMIT = Number(config.mongo.timeSeries?.batchLimit ?? 2000);
   const FIND_MAX_TIME_MS = Number(
     config.mongo.timeSeries?.findMaxTimeMs ?? 5000
@@ -78,9 +75,6 @@ export async function CreateService({
   );
   const GUARD_LAG_MS = Number(config.mongo.timeSeries?.guardLagMs ?? 0);
   const defaultEventsCollection = config.mongo.eventsCollection || "events";
-  const MAX_LOOPS_PER_CYCLE = Number(
-    config.mongo.timeSeries?.maxLoopsPerCycle ?? 10
-  );
   const SHUTDOWN_TIMEOUT_MS = Number(
     config.runtime?.shutdownTimeoutMs ?? 30_000
   );
@@ -100,11 +94,8 @@ export async function CreateService({
   }
 
   // State
-  const pollers = new Map(); // coll -> { running:boolean, delay:number }
   const pollState = new Map(); // coll -> { since: Date, lastId: ObjectId|null }
-  // processors map stores per-stream handler + runtime settings
-  // value shape: { fn, concurrency, maxQueue, queue:Set<Promise>, mapDoc?: (doc)=>any|Promise<any> }
-  const processors = new Map();
+  const processors = new Map(); // streamId -> { fn, concurrency, maxQueue, queue:Set<Promise>, mapDoc, pump, pumping, idleNudgeMs, idleTimer, batchSize }
   const perCollOverrides = new Map(); // coll -> { initialBackfillMs?: number, resetOffset?: boolean }
 
   async function loadOffset(coll, { initialBackfillMs, resetOffset } = {}) {
@@ -141,21 +132,15 @@ export async function CreateService({
       );
   }
 
+  // Deliver a doc to a stream handler with backpressure + optional mapping
   async function routeDocTo(streamId, doc, srcTag) {
     const proc = processors.get(streamId) || processors.get("default");
-    if (!proc) {
-      // No handler: skip processing safely
-      logger.debug({ streamId }, "no_handler_for_stream");
-      return;
-    }
+    if (!proc) return;
+
     const { fn, concurrency, maxQueue, queue, mapDoc } = proc;
 
     // Backpressure
     if (queue.size >= maxQueue) {
-      logger.warn(
-        { streamId, size: queue.size, maxQueue },
-        "stream_queue_overflow"
-      );
       await Promise.race(queue);
     }
 
@@ -163,6 +148,8 @@ export async function CreateService({
       try {
         const child = logger.child({ streamId, src: srcTag });
         const finalDoc = mapDoc ? await mapDoc(doc) : doc;
+
+        // Handler context (no next/defer needed in auto-pump)
         await fn(finalDoc, { logger: child, streamId, config });
       } catch (err) {
         logger.error({ err, streamId }, "stream_handler_error");
@@ -172,185 +159,242 @@ export async function CreateService({
     })();
 
     queue.add(p);
-    if (queue.size >= concurrency) await Promise.race(queue);
+    if (queue.size >= concurrency) {
+      await Promise.race(queue); // bounded concurrency
+    }
   }
 
   const badTimeWarned = new Set(); // coll
-  async function pollOnce(coll, streamId) {
+
+  // Fetch + dispatch one batch; wait for wave drain; return docs length
+  // Fetch + dispatch one batch via a streaming cursor; wait for wave drain; return docs length
+  async function fetchWave(streamId, batchSize) {
+    const coll = collFor(streamId, defaultEventsCollection);
     const state = pollState.get(coll);
     if (!state) return 0;
 
-    // Safer tie-break query
-    let query;
-    if (state.lastId) {
-      query = {
-        $or: [
-          { [timeField]: { $gt: state.since } },
-          { [timeField]: state.since, _id: { $gt: state.lastId } },
-        ],
-      };
-    } else {
-      query = { [timeField]: { $gt: state.since } };
-    }
+    // Build monotonic query (timeField, then _id)
+    const query = state.lastId
+      ? {
+          $or: [
+            { [timeField]: { $gt: state.since } },
+            { [timeField]: state.since, _id: { $gt: state.lastId } },
+          ],
+        }
+      : { [timeField]: { $gt: state.since } };
 
-    const docs = await db
+    const limit = Math.max(1, Math.floor(batchSize ?? BATCH_LIMIT));
+
+    // Stream the batch instead of materializing it
+    const cursor = db
       .collection(coll)
-      .find(query)
+      .find(query, { noCursorTimeout: false })
       .sort({ [timeField]: 1, _id: 1 })
-      .limit(BATCH_LIMIT)
-      .maxTimeMS(FIND_MAX_TIME_MS)
-      .toArray();
+      .limit(limit)
+      .maxTimeMS(FIND_MAX_TIME_MS);
 
-    if (!docs.length) return 0;
+    let count = 0;
+    const proc = processors.get(streamId);
 
-    for (const d of docs) {
-      const dt = d[timeField];
-      if (!(dt instanceof Date)) {
-        if (!badTimeWarned.has(coll)) {
+    try {
+      while (await cursor.hasNext()) {
+        const d = await cursor.next();
+        count += 1;
+
+        const dt = d[timeField];
+        if (dt instanceof Date) {
+          // routeDocTo already enforces backpressure using proc.queue/concurrency
+          await routeDocTo(streamId, d, "autopump");
+
+          if (dt > state.since) {
+            state.since = new Date(dt.getTime() - GUARD_LAG_MS);
+          }
+        } else if (!badTimeWarned.has(coll)) {
           logger.warn(
             { coll, badDocId: d?._id, timeField },
             "doc_missing_or_non_date_timefield"
           );
           badTimeWarned.add(coll);
         }
-      } else {
-        await routeDocTo(streamId, d, "poll");
-        if (dt > state.since)
-          state.since = new Date(dt.getTime() - GUARD_LAG_MS);
-      }
-      state.lastId = d._id;
-    }
 
-    await saveOffset(coll, state.since, state.lastId);
-    return docs.length;
-  }
+        state.lastId = d._id;
 
-  async function pollLoop(coll, streamId) {
-    const ctl = pollers.get(coll);
-    if (!ctl || ctl.running) return;
-    ctl.running = true;
-
-    try {
-      let fetched = 0;
-      let loops = 0;
-      do {
-        fetched = await pollOnce(coll, streamId);
-        loops++;
-        if (loops >= MAX_LOOPS_PER_CYCLE) {
-          await sleep(50);
-          loops = 0;
-        }
-        if (fetched >= Math.min(BATCH_LIMIT, 1000)) {
+        // Trickle-save offsets to improve crash resilience on big waves
+        if (count % 100 === 0) {
+          await saveOffset(coll, state.since, state.lastId);
+          // Yield occasionally to keep the event loop snappy
           await new Promise((r) => setImmediate(r));
         }
-      } while (fetched > 0);
-
-      ctl.delay = POLL_MS;
+      }
     } catch (err) {
-      logger.error({ err, coll }, "poller_error");
-      ctl.delay = Math.min((ctl.delay || POLL_MS) * 2, POLL_MS * 10);
+      logger.error({ err, streamId }, "fetch_wave_cursor_error");
+      // Re-throw so the pump schedules a retry via its catch block
+      throw err;
     } finally {
-      ctl.running = false;
-      if (pollers.has(coll)) {
-        setTimeout(() => {
-          pollLoop(coll, streamId).catch(() => {});
-        }, ctl.delay || POLL_MS).unref?.();
+      try {
+        await cursor.close();
+      } catch {}
+    }
+
+    if (count > 0) {
+      // Persist final offset for this wave
+      await saveOffset(coll, state.since, state.lastId);
+
+      // Wait for the current wave to drain (bounded by concurrency)
+      if (proc?.queue?.size > 0) {
+        await Promise.allSettled([...proc.queue]);
       }
     }
+
+    return count;
   }
-
-  async function startPollerForStream(streamId) {
-    const coll = collFor(streamId, defaultEventsCollection);
-    if (pollers.has(coll)) return;
-
-    // Resolve overrides (if any) for this collection
-    const overrides = perCollOverrides.get(coll) || {};
-    const initial = await loadOffset(coll, overrides);
-    pollState.set(coll, { since: initial.since, lastId: initial.lastId });
-    pollers.set(coll, { running: false, delay: POLL_MS });
-
-    logger.info(
-      {
-        coll,
-        streamId,
-        timeField,
-        pollMs: POLL_MS,
-        initialSinceIso: initial.since?.toISOString?.(),
-        initialSource: initial.used,
-        overrideInitialBackfillMs: overrides.initialBackfillMs,
-        resetOffset: !!overrides.resetOffset,
-        guardLagMs: GUARD_LAG_MS,
-        batchLimit: BATCH_LIMIT,
-      },
-      "poller_started"
-    );
-
-    await ensureEventIndex(coll);
-    pollLoop(coll, streamId).catch(() => {});
-  }
-
   /**
-   * Register a stream handler and start polling its collection.
+   * Register a stream handler in auto-pump mode.
+   * It will keep pulling batches automatically as long as it finds docs;
+   * on empty batch, it schedules a single idle retry after idleNudgeMs.
    *
-   * @param {string} streamId - "default" => polls 'events', otherwise 'events_<streamId>'
-   * @param {(doc: any, ctx: {logger:any, streamId:string, config:any}) => Promise<void>} handler
-   * @param {object} [opts]
-   * @param {number} [opts.concurrency=8]
-   * @param {number} [opts.maxQueue=2048]
-   * @param {number} [opts.initialBackfillMs] - Per-stream override for backfill window when no stored offset,
-   *                                            or when resetOffset=true. Capped at 7 days.
-   * @param {boolean} [opts.resetOffset=false] - If true, ignore any stored offset and start fresh using
-   *                                             `initialBackfillMs` (or global default).
-   * @param {(doc:any)=>any|Promise<any>} [opts.mapDoc] - Optional per-stream mapper: receives raw Mongo doc,
-   *                                                      returns the payload delivered to the handler.
+   * Returns: { pause, resume, unsubscribe, setBatchSize }
    */
   function onStream(
     streamId,
     handler,
     {
-      concurrency = 8,
+      concurrency = 1,
       maxQueue = 2048,
       initialBackfillMs,
       resetOffset = false,
-      mapDoc = null, // NEW
+      mapDoc = null,
+      idleNudgeMs = 1000, // retry delay when a batch is empty
+      batchSize = BATCH_LIMIT,
     } = {}
   ) {
     const coll = collFor(streamId, defaultEventsCollection);
 
-    // Store per-collection overrides BEFORE starting poller
     if (initialBackfillMs != null || resetOffset) {
-      perCollOverrides.set(coll, {
-        initialBackfillMs,
-        resetOffset,
-      });
+      perCollOverrides.set(coll, { initialBackfillMs, resetOffset });
     }
 
-    // Register handler, then start poller
-    processors.set(streamId, {
+    // Processor
+    const proc = {
       fn: handler,
       concurrency,
       maxQueue,
       queue: new Set(),
-      mapDoc, // store mapper
-    });
+      mapDoc,
+      pump: null, // function
+      pumping: false, // true while the pump loop is active
+      idleNudgeMs,
+      idleTimer: null,
+      batchSize,
+      paused: false,
+    };
+    processors.set(streamId, proc);
 
-    startPollerForStream(streamId).catch((e) =>
-      logger.error({ err: e, streamId }, "start_poller_failed")
+    (async () => {
+      const initial = await loadOffset(coll, perCollOverrides.get(coll) || {});
+      pollState.set(coll, { since: initial.since, lastId: initial.lastId });
+      await ensureEventIndex(coll);
+
+      // The pump loop: fetch wave -> if >0, loop; if 0, schedule idle nudge
+      proc.pump = async function pump() {
+        if (proc.pumping || proc.paused) return;
+        proc.pumping = true;
+        try {
+          while (!proc.paused) {
+            // Cancel any pending idle nudge since we're actively pumping
+            if (proc.idleTimer) {
+              clearTimeout(proc.idleTimer);
+              proc.idleTimer = null;
+            }
+
+            const pulled = await fetchWave(streamId, proc.batchSize);
+            if (pulled === 0) {
+              // Schedule a one-shot idle retry and stop pumping for now
+              if (proc.idleNudgeMs > 0 && !proc.paused) {
+                proc.idleTimer = setTimeout(() => {
+                  proc.idleTimer = null;
+                  // fire-and-forget: will restart pump if not paused
+                  setImmediate(() => proc.pump());
+                }, proc.idleNudgeMs);
+                proc.idleTimer.unref?.();
+              }
+              break; // exit pump loop; will be revived by idle nudge
+            }
+            // else: pulled > 0 -> continue loop immediately
+          }
+        } catch (err) {
+          logger.error({ err, streamId }, "pump_error");
+          // Be resilient: schedule an idle nudge after error
+          if (!proc.paused) {
+            proc.idleTimer = setTimeout(() => {
+              proc.idleTimer = null;
+              setImmediate(() => proc.pump());
+            }, Math.max(proc.idleNudgeMs, 1000));
+            proc.idleTimer?.unref?.();
+          }
+        } finally {
+          proc.pumping = false;
+        }
+      };
+
+      // Auto-start: kick pump once
+      setImmediate(() => proc.pump());
+
+      logger.info(
+        {
+          coll,
+          streamId,
+          timeField,
+          initialSinceIso: initial.since?.toISOString?.(),
+          initialSource: initial.used,
+          guardLagMs: GUARD_LAG_MS,
+          batchLimit: BATCH_LIMIT,
+          idleNudgeMs: proc.idleNudgeMs,
+          batchSize: proc.batchSize,
+        },
+        "autopump_stream_ready"
+      );
+    })().catch((e) =>
+      logger.error({ err: e, streamId }, "onStream_setup_failed")
     );
 
-    // Unsubscribe (drain any pending tasks for that stream)
-    return () => {
-      const proc = processors.get(streamId);
-      processors.delete(streamId);
-      return proc ? Promise.allSettled([...proc.queue]) : Promise.resolve();
+    // External control surface
+    const external = {
+      pause: () => {
+        proc.paused = true;
+        if (proc.idleTimer) {
+          clearTimeout(proc.idleTimer);
+          proc.idleTimer = null;
+        }
+      },
+      resume: () => {
+        if (!proc.paused) return;
+        proc.paused = false;
+        setImmediate(() => proc.pump());
+      },
+      setBatchSize: (n) => {
+        if (Number.isFinite(n) && n > 0) proc.batchSize = Math.floor(n);
+      },
+      unsubscribe: async () => {
+        external.pause();
+        processors.delete(streamId);
+        const st = pollState.get(coll);
+        if (st) await saveOffset(coll, st.since, st.lastId);
+        if (proc.queue.size > 0) await Promise.allSettled([...proc.queue]);
+      },
     };
+
+    return external;
   }
 
   async function shutdown() {
     const shutdownStart = Date.now();
     try {
-      // Stop future polls
-      for (const coll of pollers.keys()) pollers.delete(coll);
+      // Pause all, cancel idle nudges
+      for (const proc of processors.values()) {
+        proc.paused = true;
+        if (proc.idleTimer) clearTimeout(proc.idleTimer);
+      }
 
       // Drain all processors with optional timeout
       const waits = [];
@@ -371,8 +415,7 @@ export async function CreateService({
       }
 
       // Persist final offsets
-      for (const coll of pollState.keys()) {
-        const st = pollState.get(coll);
+      for (const [coll, st] of pollState.entries()) {
         if (st) await saveOffset(coll, st.since, st.lastId);
       }
       await client.close();
@@ -389,33 +432,22 @@ export async function CreateService({
     }
   }
 
+  /* ---------- HTTP client registry (got) ---------- */
   const createGotInstance = (baseURL, cookieJar = null, headers = null) => {
     const httpAgent = new http.Agent({ keepAlive: true });
     const httpsAgent = new https.Agent({ keepAlive: true });
 
     const options = {
       prefixUrl: baseURL,
-      agent: {
-        http: httpAgent,
-        https: httpsAgent,
-      },
+      agent: { http: httpAgent, https: httpsAgent },
     };
+    if (cookieJar) options.cookieJar = cookieJar;
+    if (headers) options.headers = headers;
 
-    if (cookieJar) {
-      options.cookieJar = cookieJar;
-    }
-
-    if (headers) {
-      options.headers = headers;
-    }
-
-    const api = got.extend(options);
-
-    return api;
+    return got.extend(options);
   };
 
   const services = new Map();
-
   function getService(serviceUrl) {
     if (!services.has(serviceUrl)) {
       services.set(serviceUrl, createGotInstance(serviceUrl));
@@ -423,8 +455,8 @@ export async function CreateService({
     return services.get(serviceUrl);
   }
 
-  const stores = new Map(); // safer than plain object for arbitrary URLs
-
+  /* ---------- DB store registry ---------- */
+  const stores = new Map();
   function getStore(dbUrl) {
     if (!stores.has(dbUrl)) {
       stores.set(dbUrl, ConnectStore(dbUrl));
@@ -447,15 +479,23 @@ export async function CreateService({
 
 /* -------------------- Example usage (commented) --------------------
 // const service = await CreateService();
-// service.onStream("payments", async (doc, { logger }) => {
-//   // doc is already mapped by mapDoc below
-//   logger.info({ preview: doc }, "payments_doc");
-// }, {
-//   initialBackfillMs: 3600000, // 1h
-//   resetOffset: true,
-//   mapDoc: (doc) => ({
-//     data: doc?.body?.data,
-//     receivedAt: doc?.receivedAt,
-//   }),
-// });
+// const ctrl = service.onStream(
+//   "cargogowhere",
+//   async (doc, { logger }) => {
+//     logger.info({ id: doc?._id }, "process_doc");
+//     // ... your work ...
+//     // Nothing else needed — it will auto-fetch next wave after this wave finishes.
+//   },
+//   {
+//     initialBackfillMs: 24 * 60 * 60 * 1000, // 24h
+//     resetOffset: true,
+//     mapDoc: (doc) => ({ data: doc?.query?.data, receivedAt: doc?.receivedAt }),
+//     idleNudgeMs: 1000,   // retry after 1s if a batch is empty
+//     batchSize: 200,      // optional override (default=BATCH_LIMIT)
+//   }
+// );
+// // You can temporarily pause/resume:
+// // ctrl.pause(); ctrl.resume();
+// // ctrl.setBatchSize(500);
+// // await ctrl.unsubscribe();
 */
