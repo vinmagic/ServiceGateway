@@ -385,6 +385,7 @@ async function getCollectionFor(name) {
 /* -------------------- Security (API key) -------------------- */
 app.addHook("onRequest", async (req, reply) => {
   req._t0_req = process.hrtime.bigint(); // earliest stamp for total time
+  req.clientIp = req.ip
   const apikeys = config.security?.apiKeys;
   if (apikeys?.enabled) {
     assert(apikeys.header, "security.apiKeys.header is required when enabled");
@@ -681,7 +682,7 @@ app.all("/*", async (req, reply) => {
       receivedAt, // TS timeField (must be set at insert)
       route: { method, path, streamId },
       source: {
-        ip: req.ip,
+        ip: req.clientIp,
         apiKey:
           req.headers[
             String(config.security?.apiKeys?.header || "").toLowerCase()
@@ -788,7 +789,7 @@ app.addHook("onResponse", async (req, reply) => {
         error: m.outcomeError || null,
       },
       client: {
-        ip: req.ip,
+        ip: req.clientIp,
         userAgent: req.headers["user-agent"],
         transferEncoding: req.headers["transfer-encoding"],
       },
