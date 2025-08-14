@@ -13,8 +13,9 @@ import fs from "fs";
 import path from "path";
 import yaml from "js-yaml";
 import pino from "pino";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import { v4 as uuidv4 } from "uuid";
+import { ConnectStore } from "./db.mjs";
 
 /* -------------------- Config + logger -------------------- */
 function loadConfig(cfgPath = "./config.yml") {
@@ -39,7 +40,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* -------------------- CreateService -------------------- */
 export async function CreateService({
-  appName = "cube",
+  appName = "microservice",
   serviceName = "stream_consumer",
   containerName = `container.${uuidv4()}`,
   configPath = "./config.yml",
@@ -388,7 +389,13 @@ export async function CreateService({
   process.on("SIGINT", () => shutdown().finally(() => process.exit(0)));
   process.on("SIGTERM", () => shutdown().finally(() => process.exit(0)));
 
-  return { onStream, shutdown, logger, config };
+  return {
+    onStream,
+    shutdown,
+    logger,
+    config,
+    connectStore: ConnectStore,
+  };
 }
 
 /* -------------------- Example usage (commented) --------------------
