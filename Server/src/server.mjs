@@ -30,10 +30,12 @@ assert(
 );
 
 const DEBUG_RESPONSES = !!config.server?.debugResponses;
+const DENY_BY_DEFAULT = !!config.server?.denyByDefault;
 
 /* Collection names (with sensible defaults) */
 const METRICS_COLLECTION = config.mongo.metricsCollection || "events_rt";
 const LOGS_COLLECTION = config.mongo.logsCollection || "applogs";
+const DENIED_COLLECTION = config.mongo.deniedCollection || "events_denied";
 
 /* -------------------- Mongo bootstrap -------------------- */
 const client = new MongoClient(config.mongo.uri, { maxPoolSize: 50 });
@@ -75,17 +77,19 @@ async function ensureTsCollection(
   return db.collection(name);
 }
 
+const TIME_FIELD = config.mongo.timeSeries?.timeField || "receivedAt";
+
 /* -------------------- Prepare collections (TS only) -------------------- */
 const eventsCol = await ensureTsCollection(config.mongo.eventsCollection, {
-  timeField: config.mongo.timeSeries?.timeField || "receivedAt",
+  timeField: TIME_FIELD,
   metaField: config.mongo.timeSeries?.metaField || "route",
   granularity: config.mongo.timeSeries?.granularity || "seconds",
   expireAfterSeconds: config.mongo.retentionDays * 86400,
 });
 await Promise.allSettled([
   eventsCol.createIndex({ "route.streamId": 1, "route.path": 1 }),
-  eventsCol.createIndex({ eventId: 1 }),
-  eventsCol.createIndex({ "route.streamId": 1, receivedAt: -1 }),
+  eventsCol.createIndex({ eventId: 1 }, { unique: true }),
+  eventsCol.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
 ]);
 
 const metricsCol = await ensureTsCollection(METRICS_COLLECTION, {
@@ -110,6 +114,19 @@ const logsCol = await ensureTsCollection(LOGS_COLLECTION, {
 await Promise.allSettled([
   logsCol.createIndex({ "meta.level": 1, "meta.app": 1, at: -1 }),
   logsCol.createIndex({ "meta.reqId": 1, at: -1 }),
+]);
+
+// Denied requests audit (time-series)
+const deniedCol = await ensureTsCollection(DENIED_COLLECTION, {
+  timeField: "at",
+  metaField: "route",
+  granularity: "seconds",
+  expireAfterSeconds:
+    (config.mongo.deniedRetentionDays ?? config.mongo.retentionDays) * 86400,
+});
+await Promise.allSettled([
+  deniedCol.createIndex({ "route.host": 1, "route.path": 1, at: -1 }),
+  deniedCol.createIndex({ code: 1, at: -1 }),
 ]);
 
 /* -------------------- Log streams: Mongo writer + tee -------------------- */
@@ -254,11 +271,11 @@ const logger = pino({ level: "info" }, teeLogStream);
 const app = Fastify({
   trustProxy: !!config.server.trustProxy,
   loggerInstance: logger, // use our Pino instance
-  // Note: bodyLimit is irrelevant since we disable parsers below.
 });
 
 // IMPORTANT: leave Fastify with no body parser so req.raw is an untouched stream
 app.removeAllContentTypeParsers();
+
 /* -------------------- Streams config (hot-reload) -------------------- */
 function loadYamlFile(fp) {
   try {
@@ -292,24 +309,49 @@ function loadStreamsFromDir(dir) {
   return out;
 }
 
+/* --- robust host normalizer (HTTP/2, LB, IPv6) --- */
+function normalizeHost(req) {
+  const raw =
+    req.headers[":authority"] ||
+    (Array.isArray(req.headers["x-forwarded-host"])
+      ? req.headers["x-forwarded-host"][0]
+      : req.headers["x-forwarded-host"]) ||
+    (Array.isArray(req.headers["host"])
+      ? req.headers["host"][0]
+      : req.headers["host"]) ||
+    "";
+  let h = raw.trim().toLowerCase();
+  // Strip port (handles IPv6 "[::1]:3000")
+  if (h.startsWith("[") && h.includes("]")) {
+    const i = h.indexOf("]");
+    h = h.slice(0, i + 1);
+  } else if (h.includes(":")) {
+    h = h.split(":")[0];
+  }
+  return h;
+}
+
+/* --- compileStreams supports match.host (regex, optional) --- */
 function compileStreams(rawList) {
   return rawList.map((s, i) => {
     const label = s?.id || `streams[${i}]`;
     assert(s?.match?.path, `${label}.match.path is required`);
-    let _re;
+    let _rePath,
+      _reHost = null;
     try {
-      _re = new RegExp(s.match.path);
+      _rePath = new RegExp(s.match.path);
+      if (s.match.host) _reHost = new RegExp(s.match.host);
     } catch (e) {
-      throw new Error(
-        `Invalid regex in ${label}.match.path: ${String(e?.message || e)}`
-      );
+      throw new Error(`Invalid regex in ${label}: ${String(e?.message || e)}`);
     }
     return {
       ...s,
-      _re,
+      _rePath,
+      _reHost,
       _methods: s.match.methods
         ? s.match.methods.map((m) => String(m).toUpperCase())
         : null,
+      // pass through s.action, s.collection, etc.
     };
   });
 }
@@ -353,12 +395,14 @@ streamsRef.cfg = buildStreamsCfg();
 })();
 
 // use streamsRef.cfg everywhere
-function findStream(method, path) {
+function findStream(method, urlPath, host) {
   const M = String(method).toUpperCase();
   const list = streamsRef.cfg;
-  return list.find(
-    (s) => (!s._methods || s._methods.includes(M)) && s._re.test(path)
-  );
+  return list.find((s) => {
+    if (s._methods && !s._methods.includes(M)) return false;
+    if (s._reHost && !s._reHost.test(host || "")) return false;
+    return s._rePath.test(urlPath);
+  });
 }
 
 const preparedCols = new Map();
@@ -367,15 +411,15 @@ async function getCollectionFor(name) {
   if (!config.mongo.usePerStreamCollections) return eventsCol;
   if (!preparedCols.has(name)) {
     const col = await ensureTsCollection(name, {
-      timeField: config.mongo.timeSeries?.timeField || "receivedAt",
+      timeField: TIME_FIELD,
       metaField: config.mongo.timeSeries?.metaField || "route",
       granularity: config.mongo.timeSeries?.granularity || "seconds",
       expireAfterSeconds: config.mongo.retentionDays * 86400,
     });
     await Promise.allSettled([
       col.createIndex({ "route.streamId": 1, "route.path": 1 }),
-      col.createIndex({ eventId: 1 }),
-      col.createIndex({ "route.streamId": 1, receivedAt: -1 }),
+      col.createIndex({ eventId: 1 }, { unique: true }),
+      col.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
     ]);
     preparedCols.set(name, col);
   }
@@ -385,7 +429,8 @@ async function getCollectionFor(name) {
 /* -------------------- Security (API key) -------------------- */
 app.addHook("onRequest", async (req, reply) => {
   req._t0_req = process.hrtime.bigint(); // earliest stamp for total time
-  req.clientIp = req.ip
+  req.clientIp = req.ip;
+  req.clientIpChain = req.headers["x-forwarded-for"];
   const apikeys = config.security?.apiKeys;
   if (apikeys?.enabled) {
     assert(apikeys.header, "security.apiKeys.header is required when enabled");
@@ -521,6 +566,17 @@ app.get("/__health", async () => ({ ok: true }));
 
 /* -------------------- Universal capture route -------------------- */
 app.all("/*", async (req, reply) => {
+  // CORS preflight handled here (avoid duplicate app.options route)
+  if (req.method === "OPTIONS") {
+    reply.header("access-control-allow-origin", "*");
+    reply.header("access-control-allow-headers", "*");
+    reply.header(
+      "access-control-allow-methods",
+      "GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS"
+    );
+    return reply.code(204).send();
+  }
+
   // Skip health without capturing
   if ((req.raw.url || "").startsWith("/__health")) {
     return reply.code(200).send({ ok: true });
@@ -529,10 +585,60 @@ app.all("/*", async (req, reply) => {
   const t0Handler = process.hrtime.bigint();
 
   const receivedAt = new Date();
-  const path = (req.raw.url || "").split("?")[0];
+  const urlPath = (req.raw.url || "").split("?")[0];
   const method = req.method;
+  const host = normalizeHost(req);
 
-  const matched = findStream(method, path);
+  const matched = findStream(method, urlPath, host);
+
+  // If deny-by-default is enabled, reject when no rule matches
+  if (!matched && DENY_BY_DEFAULT) {
+    const audit = {
+      at: new Date(),
+      route: { method, path: urlPath, host, streamId: "deny-default" },
+      client: {
+        ip: req.ip,
+        ipChain: req.headers["x-forwarded-for"],
+        userAgent: req.headers["user-agent"],
+      },
+      headers: {
+        "content-type": req.headers["content-type"],
+        "content-length": req.headers["content-length"],
+        "x-request-id": req.headers["x-request-id"],
+      },
+      code: 403,
+      reason: "denied_by_default",
+    };
+    deniedCol
+      .insertOne(audit)
+      .catch((err) => req.log.warn({ err }, "deny_default_audit_failed"));
+    return reply.code(403).send({ error: "forbidden" });
+  }
+
+  // If a matched rule says action: deny, audit + 403 (before reading body)
+  if (matched && String(matched.action).toLowerCase() === "deny") {
+    const audit = {
+      at: new Date(),
+      route: { method, path: urlPath, host, streamId: matched.id || "deny" },
+      client: {
+        ip: req.ip,
+        ipChain: req.headers["x-forwarded-for"],
+        userAgent: req.headers["user-agent"],
+      },
+      headers: {
+        "content-type": req.headers["content-type"],
+        "content-length": req.headers["content-length"],
+        "x-request-id": req.headers["x-request-id"],
+      },
+      code: 403,
+      reason: "denied_by_stream_rule",
+    };
+    deniedCol
+      .insertOne(audit)
+      .catch((err) => req.log.warn({ err }, "deny_rule_audit_failed"));
+    return reply.code(403).send({ error: "forbidden" });
+  }
+
   const streamId = matched?.id || "default";
   const targetCol = await getCollectionFor(
     matched?.collection || config.mongo.eventsCollection
@@ -550,7 +656,7 @@ app.all("/*", async (req, reply) => {
     const nowNs = process.hrtime.bigint();
     req._metrics = {
       eventId,
-      route: { method, path, streamId },
+      route: { method, path: urlPath, streamId },
       readNs: 0n,
       storeNs: 0n,
       totalHandlerNs: nowNs - t0Handler,
@@ -573,7 +679,7 @@ app.all("/*", async (req, reply) => {
   // metrics scaffold
   req._metrics = {
     eventId,
-    route: { method, path, streamId },
+    route: { method, path: urlPath, streamId },
     readNs: 0n,
     storeNs: 0n,
     totalHandlerNs: 0n,
@@ -599,7 +705,7 @@ app.all("/*", async (req, reply) => {
           filename: `${eventId}`,
           contentType,
           limit,
-          metadata: { eventId, streamId, path, method, receivedAt },
+          metadata: { eventId, streamId, path: urlPath, method, receivedAt },
         });
         if (size === 0 || !id) {
           bodyInfo = { type: "none", size: 0, data: null };
@@ -640,7 +746,7 @@ app.all("/*", async (req, reply) => {
             filename: `${eventId}`,
             contentType,
             limit,
-            metadata: { eventId, streamId, path, method, receivedAt },
+            metadata: { eventId, streamId, path: urlPath, method, receivedAt },
           });
           if (gsize === 0 || !id) {
             bodyInfo = { type: "none", size: 0, data: null };
@@ -661,7 +767,7 @@ app.all("/*", async (req, reply) => {
           filename: `${eventId}`,
           contentType,
           limit,
-          metadata: { eventId, streamId, path, method, receivedAt },
+          metadata: { eventId, streamId, path: urlPath, method, receivedAt },
         });
         if (size === 0 || !id) {
           bodyInfo = { type: "none", size: 0, data: null };
@@ -680,9 +786,10 @@ app.all("/*", async (req, reply) => {
     const doc = {
       eventId,
       receivedAt, // TS timeField (must be set at insert)
-      route: { method, path, streamId },
+      route: { method, path: urlPath, streamId, host },
       source: {
         ip: req.clientIp,
+        ipChain: req.clientIpChain,
         apiKey:
           req.headers[
             String(config.security?.apiKeys?.header || "").toLowerCase()
@@ -746,10 +853,16 @@ app.all("/*", async (req, reply) => {
 /* -------------------- Debug body fetch (auth enforced by onRequest) -------------------- */
 app.get("/__body/:eventId", async (req, reply) => {
   const { eventId } = req.params;
-  const ev = await eventsCol.findOne(
+  let ev = await eventsCol.findOne(
     { eventId },
     { projection: { body: 1, meta: 1 } }
   );
+  if (!ev && config.mongo.usePerStreamCollections) {
+    for (const [_name, col] of preparedCols.entries()) {
+      ev = await col.findOne({ eventId }, { projection: { body: 1, meta: 1 } });
+      if (ev) break;
+    }
+  }
   if (!ev) return reply.code(404).send({ error: "not_found" });
   const ct = ev.meta?.contentType || "application/octet-stream";
   if (ev.body?.type === "gridfs") {
@@ -835,5 +948,5 @@ process.on("SIGHUP", () => {
 /* -------------------- Start server -------------------- */
 await app.listen({ port: config.server.port, host: "0.0.0.0" });
 app.log.info(
-  `API GW listening on :${config.server.port} (TS-only; metrics=${METRICS_COLLECTION}; logs=${LOGS_COLLECTION})`
+  `API GW listening on :${config.server.port} (TS-only; metrics=${METRICS_COLLECTION}; logs=${LOGS_COLLECTION}; denied=${DENIED_COLLECTION}; denyByDefault=${DENY_BY_DEFAULT})`
 );
