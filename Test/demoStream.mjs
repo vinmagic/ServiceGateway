@@ -1,15 +1,11 @@
 // demoStream.mjs
 import { CreateService } from "../MicroService/src/main.mjs";
 
-const { onStream, logger, config, getStore, getService,  } =
-  await CreateService({
-    appName: "test",
-  });
+const { onStream, logger, config, getStore, getService } = await CreateService({
+  appName: "test",
+});
 
-
-
-
-const service = getService("http://localhost:3000");
+const responseService = getService("http://localhost:8080");
 
 // Will poll "events_payments"
 onStream(
@@ -21,7 +17,18 @@ onStream(
         resolve();
       }, 5000);
     });
-    console.log(`---->done`);
+    console.log(`---->done`, doc);
+    const result = await responseService.post(`cargogowhere_result/`, {
+      headers: {
+        ["x-api-key"]: `dev-key-123`,
+        ["X-Correlation-Id"]: doc.correlationId,
+      },
+      json: {
+        message: "all done",
+      },
+      responseType: "json",
+    });
+    console.log(`---->result`, result.body);
   },
   {
     concurrency: 1, // one doc at a time => ordered logs
@@ -32,6 +39,7 @@ onStream(
     mapDoc: (doc) => ({
       data: doc?.route?.path,
       receivedAt: doc?.receivedAt,
+      correlationId: doc?.correlationId,
     }),
     idleNudgeMs: 1000,
   }

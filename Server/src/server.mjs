@@ -91,9 +91,9 @@ const eventsCol = await ensureTsCollection(config.mongo.eventsCollection, {
 });
 await Promise.allSettled([
   eventsCol.createIndex({ "route.streamId": 1, "route.path": 1 }),
-  eventsCol.createIndex({ eventId: 1 }, { unique: true }),
+  eventsCol.createIndex({ eventId: 1 }), // TS: non-unique
   eventsCol.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
-  eventsCol.createIndex({ correlationId: 1, [TIME_FIELD]: -1 }), // NEW: correlate quickly
+  eventsCol.createIndex({ correlationId: 1, [TIME_FIELD]: -1 }),
 ]);
 
 const metricsCol = await ensureTsCollection(METRICS_COLLECTION, {
@@ -295,6 +295,7 @@ const teeLogStream = createTeeStream([process.stdout, mongoLogStream]);
 /* Build Pino logger that writes to our tee stream */
 const logger = pino({ level: "info" }, teeLogStream);
 
+
 /* -------------------- Fastify init -------------------- */
 const app = Fastify({
   trustProxy: !!config.server.trustProxy,
@@ -360,6 +361,8 @@ function normalizeHost(req) {
   } else if (h.includes(":")) {
     h = h.split(":")[0];
   }
+  // strip trailing dot if any
+  if (h.endsWith(".")) h = h.slice(0, -1);
   return h;
 }
 
@@ -472,7 +475,7 @@ async function getCollectionFor(name) {
     });
     await Promise.allSettled([
       col.createIndex({ "route.streamId": 1, "route.path": 1 }),
-      col.createIndex({ eventId: 1 }, { unique: true }),
+      col.createIndex({ eventId: 1 }), // TS: non-unique
       col.createIndex({ "route.streamId": 1, [TIME_FIELD]: -1 }),
       col.createIndex({ correlationId: 1, [TIME_FIELD]: -1 }),
     ]);
@@ -620,7 +623,6 @@ function streamToGridFS({ stream, filename, contentType, limit, metadata }) {
 app.get("/__health", async () => ({ ok: true }));
 
 /* -------------------- Wait helper against a specific results collection -------------------- */
-// Replace your waitForResultIn with this bounded-poll version
 async function waitForResultIn(resultsCol, correlationId, timeoutMs) {
   const deadline = Date.now() + Math.max(0, timeoutMs ?? 0);
 
@@ -630,43 +632,56 @@ async function waitForResultIn(resultsCol, correlationId, timeoutMs) {
     return { ready: true, doc: existing };
   }
 
-  // 2) Open a change stream and poll with tryNext() until timeout
-  //    Keep maxAwaitTimeMS small so each await returns regularly.
-  const cs = resultsCol.watch(
-    [
-      {
-        $match: {
-          "fullDocument.correlationId": correlationId,
-          operationType: { $in: ["insert", "update", "replace"] },
+  // 2) Change stream (if available) + polling
+  let cs = null;
+  try {
+    cs = resultsCol.watch(
+      [
+        {
+          $match: {
+            "fullDocument.correlationId": correlationId,
+            operationType: { $in: ["insert", "update", "replace"] },
+          },
         },
-      },
-    ],
-    { fullDocument: "updateLookup", maxAwaitTimeMS: 500 } // short server-side wait
-  );
+      ],
+      { fullDocument: "updateLookup", maxAwaitTimeMS: 500 }
+    );
+  } catch {}
 
   try {
     while (Date.now() < deadline) {
-      const change = await cs.tryNext(); // returns null if nothing ready
-      if (change && change.fullDocument) {
-        const doc = change.fullDocument;
-        if (doc.status === "done" || doc.status === "error") {
-          try { await cs.close(); } catch {}
-          return { ready: true, doc };
+      if (cs) {
+        const change = await cs.tryNext();
+        if (change && change.fullDocument) {
+          const doc = change.fullDocument;
+          if (doc.status === "done" || doc.status === "error") {
+            try {
+              await cs.close();
+            } catch {}
+            return { ready: true, doc };
+          }
         }
       }
 
-      // Optional: cheap recheck in case another process wrote between polls
       const doc = await resultsCol.findOne({ correlationId });
       if (doc && (doc.status === "done" || doc.status === "error")) {
-        try { await cs.close(); } catch {}
+        if (cs) {
+          try {
+            await cs.close();
+          } catch {}
+        }
         return { ready: true, doc };
       }
+
+      await new Promise((r) => setTimeout(r, 120));
     }
-  } catch (e) {
-    // swallow and fall through to not-ready
+  } catch {
+    // ignore
   }
 
-  try { await cs.close(); } catch {}
+  try {
+    if (cs) await cs.close();
+  } catch {}
   return { ready: false };
 }
 
@@ -680,7 +695,89 @@ app.all("/*", async (req, reply) => {
       "access-control-allow-methods",
       "GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS"
     );
+
     return reply.code(204).send();
+  }
+
+  // --- Result lookup inside universal handler ---
+  // Runs only for GET .../<eventId> where eventId is UUID v1–5 or 32-hex
+  if (req.method === "GET") {
+    const urlPath = (req.raw.url || "").split("?")[0];
+    const m = urlPath.match(
+      /\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[0-9a-f]{32})$/i
+    );
+    if (m) {
+      const correlationId = m[1];
+
+      // Fallback: try to infer by matching the BASE path (strip the /:eventId)
+      const basePath = urlPath.slice(
+        0,
+        urlPath.length - (correlationId.length + 1)
+      );
+      const host = normalizeHost(req);
+      // find stream ignoring method (some rules are POST-only)
+      const candidates = streamsRef.cfg.filter((s) => {
+        if (s._reHost && !s._reHost.test(host || "")) return false;
+        return s._rePath.test(basePath);
+      });
+      candidates.sort(
+        (a, b) => Number(b.priority || 0) - Number(a.priority || 0)
+      );
+      if (!candidates.length) {
+        return reply.code(404).send({
+          error: "no_matching_stream_for_request",
+          details: { path: basePath, host },
+        });
+      }
+
+      const streamId = candidates[0].id || "default";
+
+      // 2) Find that stream’s configured result collection
+      const streamCfg = streamsRef.cfg.find(
+        (s) => (s.id || "default") === streamId
+      );
+      const resultColName =
+        streamCfg?.resultCollection || GLOBAL_RESULTS_COLLECTION;
+
+      // 3) Query the right results collection
+      knownResultCollectionNames.add(resultColName);
+      const resultsCol = await getResultsCollectionFor(resultColName);
+
+      // Prefer matching by correlationId; include meta.streamId when we know it
+      const findQuery = { correlationId };
+
+      const doc = await resultsCol.findOne(findQuery);
+
+      if (!doc) {
+        return reply.send({
+          status: "processing",
+          streamId,
+          eventId: correlationId,
+        });
+      }
+      if (doc.status === "done") {
+        return reply.send({
+          status: "done",
+          streamId,
+          eventId: correlationId,
+          result: doc.result ?? null,
+        });
+      }
+      if (doc.status === "error") {
+        return reply.code(500).send({
+          status: "error",
+          streamId,
+          eventId: correlationId,
+          error: doc.error ?? "processing_failed",
+        });
+      }
+
+      return reply.send({
+        status: String(doc.status || "processing"),
+        streamId,
+        eventId: correlationId,
+      });
+    }
   }
 
   // Skip health without capturing
@@ -703,9 +800,10 @@ app.all("/*", async (req, reply) => {
       at: new Date(),
       route: { method, path: urlPath, host, streamId: "deny-default" },
       client: {
-        ip: req.ip,
-        ipChain: req.headers["x-forwarded-for"],
+        ip: req.clientIp,
+        ipChain: req.clientIpChain,
         userAgent: req.headers["user-agent"],
+        transferEncoding: req.headers["transfer-encoding"],
       },
       headers: {
         "content-type": req.headers["content-type"],
@@ -727,9 +825,10 @@ app.all("/*", async (req, reply) => {
       at: new Date(),
       route: { method, path: urlPath, host, streamId: matched.id || "deny" },
       client: {
-        ip: req.ip,
-        ipChain: req.headers["x-forwarded-for"],
+        ip: req.clientIp,
+        ipChain: req.clientIpChain,
         userAgent: req.headers["user-agent"],
+        transferEncoding: req.headers["transfer-encoding"],
       },
       headers: {
         "content-type": req.headers["content-type"],
@@ -802,7 +901,7 @@ app.all("/*", async (req, reply) => {
               streamId: matched.id,
               host,
               path: urlPath,
-              sourceIp: req.ip,
+              sourceIp: req.clientIp,
               ua: req.headers["user-agent"],
             },
           },
@@ -1047,7 +1146,6 @@ app.all("/*", async (req, reply) => {
       const resultColName =
         matched?.resultCollection || GLOBAL_RESULTS_COLLECTION;
 
-      // ensure the declared result collection is known and prepared
       knownResultCollectionNames.add(resultColName);
       const resultsCol = await getResultsCollectionFor(resultColName);
 
@@ -1077,14 +1175,12 @@ app.all("/*", async (req, reply) => {
     }
 
     // async fallback
-    res
-      .code(202)
-      .send({
-        status: "accepted",
-        eventId,
-        streamId,
-        pollUrl: `/results/${eventId}`,
-      });
+    res.code(202).send({
+      status: "accepted",
+      eventId,
+      streamId,
+      pollUrl: `/${eventId}`,
+    });
   } catch (e) {
     if (e?.message === "payload_too_large") {
       req._metrics.code = 413;
@@ -1133,57 +1229,6 @@ app.get("/__body/:eventId", async (req, reply) => {
   return reply.send(String(ev.body?.data ?? ""));
 });
 
-/* -------------------- Results polling (respects per-stream result collections) -------------------- */
-app.get("/results/:eventId", async (req, reply) => {
-  const correlationId = req.params.eventId;
-
-  // Find the original request's stream to locate its configured resultCollection
-  let reqEvent = await eventsCol.findOne(
-    { eventId: correlationId },
-    { projection: { route: 1 } }
-  );
-  if (!reqEvent && config.mongo.usePerStreamCollections) {
-    for (const [, col] of preparedCols.entries()) {
-      reqEvent = await col.findOne(
-        { eventId: correlationId },
-        { projection: { route: 1 } }
-      );
-      if (reqEvent) break;
-    }
-  }
-
-  const streamId = reqEvent?.route?.streamId || "default";
-  const streamCfg = streamsRef.cfg.find(
-    (s) => (s.id || "default") === streamId
-  );
-
-  const resultColName =
-    streamCfg?.resultCollection || GLOBAL_RESULTS_COLLECTION;
-
-  // ensure prepared
-  knownResultCollectionNames.add(resultColName);
-  const resultsCol = await getResultsCollectionFor(resultColName);
-  const doc = await resultsCol.findOne({ correlationId });
-
-  if (!doc) return reply.send({ status: "processing", eventId: correlationId });
-  if (doc.status === "done")
-    return reply.send({
-      status: "done",
-      eventId: correlationId,
-      result: doc.result ?? null,
-    });
-  if (doc.status === "error")
-    return reply.code(500).send({
-      status: "error",
-      eventId: correlationId,
-      error: doc.error ?? "processing_failed",
-    });
-  return reply.send({
-    status: String(doc.status || "processing"),
-    eventId: correlationId,
-  });
-});
-
 /* -------------------- After-response: write metrics -------------------- */
 app.addHook("onResponse", async (req, reply) => {
   try {
@@ -1213,6 +1258,7 @@ app.addHook("onResponse", async (req, reply) => {
       },
       client: {
         ip: req.clientIp,
+        ipChain: req.clientIpChain,
         userAgent: req.headers["user-agent"],
         transferEncoding: req.headers["transfer-encoding"],
       },
