@@ -9,14 +9,13 @@ const responseService = getService("http://localhost:8080");
 
 // Will poll "events_payments"
 onStream(
-  "cargogowhere",
+  "trackforall",
   async (doc, { logger }) => {
-    await new Promise((resolve, reject) => {
-      setTimeout(() => {
-        resolve();
-      }, 5000);
-    });
-    const result = await responseService.post(`cargogowhere_result/`, {
+    
+
+    console.log(`------>`, doc.correlationId);
+
+    const result = await responseService.post(`trackforall_result/`, {
       headers: {
         ["x-api-key"]: `dev-key-123`,
         ["X-Correlation-Id"]: doc.correlationId,

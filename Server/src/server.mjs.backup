@@ -403,12 +403,10 @@ const streamsDir =
 let streamsRef = { cfg: [] };
 
 function buildStreamsCfg() {
-  const merged = [
-    ...loadStreamsFromDir(streamsDir),
-    ...(Array.isArray(config.streams) ? config.streams : []),
-  ];
+  const merged = [...loadStreamsFromDir(streamsDir)];
   const compiled = compileStreams(merged);
 
+  compiled.sort((a, b) => (b.priority || 0) - (a.priority || 0));
   // Rebuild known result collections set from all rules:
   knownResultCollectionNames.clear();
   // From request rules declaring resultCollection
@@ -734,18 +732,6 @@ async function waitForResultIn(resultsCol, correlationId, timeoutMs) {
 
 /* -------------------- Universal capture route -------------------- */
 app.all("/*", async (req, reply) => {
-  // CORS preflight handled here (avoid duplicate app.options route)
-  if (req.method === "OPTIONS") {
-    reply.header("access-control-allow-origin", CORS_ALLOW_ORIGIN);
-    reply.header("access-control-allow-headers", "*");
-    reply.header(
-      "access-control-allow-methods",
-      "GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS"
-    );
-
-    return reply.code(204).send();
-  }
-
   // --- Result lookup inside universal handler ---
   // Runs only for GET .../<eventId> where eventId is UUID v1–5 or 32-hex
   if (req.method === "GET") {

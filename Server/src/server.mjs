@@ -1,30 +1,16 @@
-import Fastify from "fastify";
-import { logger } from "./observability/logger.mjs";
-import metricsPlugin from "./observability/metrics-plugin.mjs";
-import apikeyPlugin from "./security/apikey-plugin.mjs";
-import healthRoutes from "./http/routes-health.mjs";
-import universalRoutes from "./http/routes-universal.mjs";
-import { initStreams } from "./streams/manager.mjs";
-import { config } from "./config/config.mjs";
+import { loadConfig } from "./config.mjs";
+import { connectMongo, ensureTsCollection } from "./mongo.mjs";
+import { buildApp } from "./app.mjs";
+import { registerShutdown } from "./shutdown.mjs";
 
-export async function buildServer() {
-  const app = Fastify({
-    trustProxy: !!config.server.trustProxy,
-    loggerInstance: logger,
-  });
+const config = loadConfig("./config.yml");
+const { client, db, gfs } = await connectMongo(config);
+const app = await buildApp({ config, db, gfs });
 
-  // Keep request body as raw stream
-  app.removeAllContentTypeParsers();
-  app.addContentTypeParser("*", (req, payload, done) => done(null, payload));
+await app.listen({ port: config.server.port, host: "0.0.0.0" });
+app.log.info(
+  `API GW listening on :${config.server.port} (denyByDefault=${!!config.server
+    .denyByDefault})`
+);
 
-  // Streams
-  const streamsRef = await initStreams(app.log, config.server.streamsDir);
-
-  // Plugins & routes
-  await app.register(apikeyPlugin, { config });
-  await app.register(metricsPlugin, { config });
-  await app.register(healthRoutes, { config, streamsRef });
-  await app.register(universalRoutes, { config, streamsRef });
-
-  return app;
-}
+registerShutdown(app, client);

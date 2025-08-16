@@ -1,1 +1,0 @@
-SERVICE=${SERVICE} npm run build_push && SERVICE=${SERVICE} SERVER=2406:da18:6d9:e900:53e2:294b:34ca:eb28 npm run deploy_app && SERVICE=${SERVICE} SERVER=2406:da18:6d9:e900:8ce8:356:7ba9:62d2 npm run deploy_app

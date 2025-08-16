@@ -1,1 +1,0 @@
-docker build -f ${SERVICE}.dockerfile --platform linux/amd64 -t savingpanda/${SERVICE} . && docker push savingpanda/${SERVICE}

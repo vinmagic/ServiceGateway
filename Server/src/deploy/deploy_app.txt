@@ -1,1 +1,0 @@
-sudo ssh -i ssh-keys/amazon-lightsail-default-key.pem ubuntu@${SERVER} sudo docker pull savingpanda/${SERVICE} && sudo ssh -i ssh-keys/amazon-lightsail-default-key.pem ubuntu@${SERVER} sudo docker system prune -f
