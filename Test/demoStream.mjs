@@ -1,5 +1,5 @@
 // demoStream.mjs
-import { CreateService } from "../MicroService/src/main.mjs";
+import { CreateService } from "../MicroService/index.mjs";
 
 const { onStream, logger, config, getStore, getService } = await CreateService({
   appName: "test",
@@ -11,13 +11,11 @@ const responseService = getService("http://localhost:8080");
 onStream(
   "cargogowhere",
   async (doc, { logger }) => {
-    console.log(`---->`, doc.receivedAt);
     await new Promise((resolve, reject) => {
       setTimeout(() => {
         resolve();
       }, 5000);
     });
-    console.log(`---->done`, doc);
     const result = await responseService.post(`cargogowhere_result/`, {
       headers: {
         ["x-api-key"]: `dev-key-123`,
@@ -28,7 +26,6 @@ onStream(
       },
       responseType: "json",
     });
-    console.log(`---->result`, result.body);
   },
   {
     concurrency: 1, // one doc at a time => ordered logs
